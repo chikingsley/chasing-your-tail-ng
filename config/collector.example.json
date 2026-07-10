@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "name": "tail-chasing-portable",
+  "mode": "portable",
+  "wifi_interfaces": [
+    "wlan1"
+  ],
+  "bluetooth_interfaces": [
+    "hci0"
+  ],
+  "runtime_dir": "runtime/kismet",
+  "session_name": "kismet-tail",
+  "http_bind_address": "127.0.0.1",
+  "http_url": "http://127.0.0.1:2501",
+  "gps_definition": null,
+  "log_packets": false
+}

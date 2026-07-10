@@ -9,24 +9,15 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+.DS_Store
 
 # Local environment and secrets
 .env
 .env.*
 !.env.example
-secure_credentials/
 
-# Runtime logs and generated reports
+# Repo-local collector state
 runtime/
-ignore_lists/
-logs/
-analysis_logs/
-reports/
-surveillance_reports/
-kml_files/
-cyt_security.log
-surveillance_analysis.log
-gui_startup.log
 
 # Local Kismet captures and SQLite sidecars
 *.kismet

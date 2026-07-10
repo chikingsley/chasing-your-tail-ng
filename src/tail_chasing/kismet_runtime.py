@@ -19,6 +19,8 @@ DEFAULT_RUNTIME_DIR = Path("runtime/kismet")
 DEFAULT_SESSION_NAME = "kismet-tail"
 DEFAULT_HTTP_URL = "http://127.0.0.1:2501"
 DEFAULT_LOG_TITLE = "tail-chasing"
+DEFAULT_SERVER_LOG_NAME = "kismet-server.log"
+DATABASE_STALE_AFTER_SECONDS = 90
 _SQLITE_LOCK_RETRIES = 5
 _SQLITE_LOCK_RETRY_DELAY_SECONDS = 0.5
 _COUNT_QUERIES = {
@@ -45,6 +47,7 @@ class KismetAuth:
 class KismetDatabaseSummary:
     path: Path
     size_bytes: int
+    modified_at: float
     row_counts: dict[str, int]
 
     def as_dict(self) -> dict[str, object]:
@@ -89,12 +92,17 @@ class KismetRuntimeStatus:
     system_version: str | None
     sources: tuple[KismetSourceStatus, ...]
     latest_database: KismetDatabaseSummary | None
+    database_logging_healthy: bool | None
+    database_logging_detail: str
+    server_log: Path
+    server_log_error: str | None
 
     def as_dict(self) -> dict[str, object]:
         payload = asdict(self)
         payload["runtime_dir"] = str(self.runtime_dir)
         if self.latest_database is not None:
             payload["latest_database"] = self.latest_database.as_dict()
+        payload["server_log"] = str(self.server_log)
         return payload
 
 
@@ -104,8 +112,14 @@ def ensure_runtime_config(
     sources: Sequence[str],
     username: str | None = None,
     log_title: str = DEFAULT_LOG_TITLE,
+    log_packets: bool = False,
+    http_bind_address: str = "127.0.0.1",
+    gps_definition: str | None = None,
 ) -> tuple[Path, Path]:
     """Create repo-local Kismet runtime config files."""
+    http_bind_address = _single_line_value(http_bind_address, name="HTTP bind address")
+    if gps_definition is not None:
+        gps_definition = _single_line_value(gps_definition, name="GPS definition")
     runtime_dir = runtime_dir.resolve()
     logs_dir = runtime_dir / "logs"
     home_dir = runtime_dir / "home"
@@ -128,16 +142,25 @@ def ensure_runtime_config(
 
     config_path = runtime_dir / "kismet.conf"
     source_lines = "\n".join(f"source={source}" for source in _normalize_sources(sources))
+    gps_lines = [f"gps={gps_definition}"] if gps_definition is not None else []
     config_path.write_text(
         "\n".join(
             [
-                "httpd_bind_address=127.0.0.1",
+                f"httpd_bind_address={http_bind_address}",
                 f"httpd_auth_file={auth_path}",
                 f"httpd_session_db={runtime_dir / 'session.db'}",
                 f"httpd_user_home={httpd_dir}",
                 f"log_prefix={logs_dir}",
                 "log_types=kismet",
                 f"log_title={log_title}",
+                "kis_log_devices=true",
+                "kis_log_device_rate=30",
+                f"kis_log_packets={str(log_packets).lower()}",
+                "kis_log_messages=true",
+                "kis_log_alerts=true",
+                "kis_log_datasources=true",
+                "kis_log_datasources_rate=30",
+                *gps_lines,
                 source_lines,
                 "",
             ],
@@ -154,13 +177,24 @@ def start_kismet(
     sources: Sequence[str],
     session_name: str = DEFAULT_SESSION_NAME,
     log_title: str = DEFAULT_LOG_TITLE,
+    log_packets: bool = False,
+    http_bind_address: str = "127.0.0.1",
+    gps_definition: str | None = None,
 ) -> None:
     """Start Kismet in a tmux session with repo-local state."""
     if tmux_session_running(session_name):
         raise KismetRuntimeError(f"tmux session already exists: {session_name}")
 
-    config_path, _ = ensure_runtime_config(runtime_dir, sources=sources, log_title=log_title)
+    config_path, _ = ensure_runtime_config(
+        runtime_dir,
+        sources=sources,
+        log_title=log_title,
+        log_packets=log_packets,
+        http_bind_address=http_bind_address,
+        gps_definition=gps_definition,
+    )
     runtime_dir = runtime_dir.resolve()
+    server_log = runtime_dir / DEFAULT_SERVER_LOG_NAME
     command = " ".join(
         [
             "cd",
@@ -176,6 +210,9 @@ def start_kismet(
             shlex.quote(log_title),
             "--override",
             shlex.quote(str(config_path)),
+            ">",
+            shlex.quote(str(server_log)),
+            "2>&1",
         ],
     )
     grouped_command = f"sg kismet -c {shlex.quote(command)}"
@@ -208,18 +245,32 @@ def get_runtime_status(
             sources_payload = [item for item in source_data if isinstance(item, dict)]
 
     database_path = latest_kismet_database(runtime_dir)
+    database_summary = (
+        summarize_kismet_database(database_path) if database_path is not None else None
+    )
+    server_log = runtime_dir / DEFAULT_SERVER_LOG_NAME
+    server_log_error = _latest_server_log_error(server_log)
+    session_running = tmux_session_running(session_name)
+    logging_healthy, logging_detail = _database_logging_health(
+        session_running=session_running,
+        http_reachable=status_payload is not None,
+        database=database_summary,
+        server_log_error=server_log_error,
+    )
     return KismetRuntimeStatus(
         runtime_dir=runtime_dir,
         session_name=session_name,
-        session_running=tmux_session_running(session_name),
+        session_running=session_running,
         http_url=http_url,
         http_reachable=status_payload is not None,
         system_devices=_optional_int(status_payload, "kismet.system.devices.count"),
         system_version=_optional_str(status_payload, "kismet.system.version"),
         sources=tuple(KismetSourceStatus.from_api(source) for source in sources_payload),
-        latest_database=summarize_kismet_database(database_path)
-        if database_path is not None
-        else None,
+        latest_database=database_summary,
+        database_logging_healthy=logging_healthy,
+        database_logging_detail=logging_detail,
+        server_log=server_log,
+        server_log_error=server_log_error,
     )
 
 
@@ -302,8 +353,53 @@ def summarize_kismet_database(database_path: Path) -> KismetDatabaseSummary:
     return KismetDatabaseSummary(
         path=database_path,
         size_bytes=database_path.stat().st_size,
+        modified_at=database_path.stat().st_mtime,
         row_counts=row_counts,
     )
+
+
+def _database_logging_health(
+    *,
+    session_running: bool,
+    http_reachable: bool,
+    database: KismetDatabaseSummary | None,
+    server_log_error: str | None,
+) -> tuple[bool | None, str]:
+    if not session_running:
+        return None, "capture is stopped"
+    if not http_reachable:
+        return False, "Kismet HTTP is unreachable"
+    if server_log_error is not None:
+        return False, server_log_error
+    if database is None:
+        return False, "Kismet has not created a database"
+
+    age_seconds = max(0.0, time.time() - database.modified_at)
+    if age_seconds > DATABASE_STALE_AFTER_SECONDS:
+        return False, f"database has not changed for {age_seconds:.0f} seconds"
+    return True, f"database changed {age_seconds:.0f} seconds ago"
+
+
+def _latest_server_log_error(server_log: Path) -> str | None:
+    if not server_log.exists():
+        return None
+
+    error_markers = (
+        "kis_database_logfile unable",
+        "unable to insert",
+        "sql logic error",
+        "database is locked",
+        "database or disk is full",
+        "disk i/o error",
+    )
+    with server_log.open("rb") as stream:
+        stream.seek(0, 2)
+        stream.seek(max(0, stream.tell() - 1_048_576))
+        lines = stream.read().decode("utf-8", errors="replace").splitlines()
+    for line in reversed(lines):
+        if any(marker in line.lower() for marker in error_markers):
+            return line.strip()
+    return None
 
 
 def tmux_session_running(session_name: str = DEFAULT_SESSION_NAME) -> bool:
@@ -322,6 +418,15 @@ def _normalize_sources(sources: Sequence[str]) -> tuple[str, ...]:
     normalized = tuple(source.strip() for source in sources if source.strip())
     if not normalized:
         raise KismetRuntimeError("At least one Kismet source is required.")
+    if any("\n" in source or "\r" in source for source in normalized):
+        raise KismetRuntimeError("Kismet source definitions must fit on one line.")
+    return normalized
+
+
+def _single_line_value(value: str, *, name: str) -> str:
+    normalized = value.strip()
+    if not normalized or "\n" in normalized or "\r" in normalized:
+        raise KismetRuntimeError(f"{name} must be a non-empty, single-line value.")
     return normalized
 
 
