@@ -1,3 +1,5 @@
+# Copyright (c) 2025 @matt0177. MIT License, see LICENSE.
+
 from __future__ import annotations
 
 import json
@@ -62,6 +64,7 @@ def root(
 
 @collector_app.command("setup")
 def setup_collector(
+    *,
     name: Annotated[
         str,
         typer.Option("--name", help="Stable name for this physical collector."),

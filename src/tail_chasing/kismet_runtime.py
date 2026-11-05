@@ -1,3 +1,5 @@
+# Copyright (c) 2025 @matt0177. MIT License, see LICENSE.
+
 from __future__ import annotations
 
 import getpass
